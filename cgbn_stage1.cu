@@ -31,6 +31,10 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #include <stdio.h>
 #include <stdlib.h>
 #include <vector>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <algorithm>
 
 // GMP import must proceed cgbn.h
 #include <gmp.h>
@@ -62,6 +66,10 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #else
     #define FORCE_INLINE
 #endif
+
+// Checkpoint configuration
+#define CHECKPOINT_MAGIC 0x45555047  // EPUG -> "GPUE" in hex (GPU ECM)
+#define CHECKPOINT_VERSION 3         // Incremented to invalidate old checkpoint files
 
 // support routine copied from  "CGBN/samples/utility/support.h"
 void cgbn_check(cgbn_error_report_t *report, const char *file=NULL, int32_t line=0) {
@@ -656,11 +664,174 @@ int print_nth_batch(int n)
           (n % 10000 == 0));
 }
 
+/**
+ * Checkpoint structure containing state information
+ */
+typedef struct {
+  uint32_t magic;            // Magic number for validation
+  uint32_t version;          // Checkpoint format version
+  uint64_t s_partial;        // Current bit progress
+  uint64_t s_num_bits;       // Total bits to process
+  int32_t batches_complete;  // Number of completed batches
+  uint32_t curves;           // Number of curves
+  uint32_t sigma;            // Starting sigma value
+  uint32_t BITS;             // Kernel bit size
+  uint32_t TPI;              // Threads per instance (needed for kernel selection)
+  size_t data_size;          // Size of GPU data
+  time_t timestamp;          // When checkpoint was created
+} checkpoint_header_t;
+
+/**
+ * Get checkpoint filename for given N (more readable format)
+ * Uses bit length and first/last few hex chars as identifier
+ */
+static
+char* get_checkpoint_filename(const mpz_t N) {
+  static char filename[512];
+  
+  size_t nbits = mpz_sizeinbase(N, 2);
+  
+  // Get first and last few chars of N in hex for unique identifier.
+  // Use GMP-allocated buffer to avoid stack overflow for large N.
+  char *N_str = mpz_get_str(NULL, 16, N);
+  if (N_str == NULL) {
+    snprintf(filename, sizeof(filename), ".ecm_ckpt_%zu_alloc_fail.dat", nbits);
+    return filename;
+  }
+
+  size_t len = strlen(N_str);
+  char first_hex[16] = {0};
+  char last_hex[16] = {0};
+  
+  // First 8 chars (or less if N is small)
+  strncpy(first_hex, N_str, (len >= 8) ? 8 : len);
+  // Last 8 chars
+  if (len > 8) {
+    strncpy(last_hex, N_str + len - 8, 8);
+  }
+  
+  // Format: .ecm_ckpt_<nbits>_<first8>_<last8>.dat
+  // Example: .ecm_ckpt_127_7fffffff_ffffffff.dat (much more readable than full hex)
+  if (len > 8 && last_hex[0] != '\0') {
+    snprintf(filename, sizeof(filename), ".ecm_ckpt_%zu_%s_%s.dat", nbits, first_hex, last_hex);
+  } else {
+    snprintf(filename, sizeof(filename), ".ecm_ckpt_%zu_%s.dat", nbits, first_hex);
+  }
+
+  free(N_str);
+  
+  return filename;
+}
+
+/**
+ * Save checkpoint to file
+ */
+static
+int save_checkpoint(const char *filename, 
+                    const checkpoint_header_t *header,
+                    const uint32_t *data, 
+                    size_t data_size) {
+  FILE *f = fopen(filename, "wb");
+  if (!f) {
+    outputf(OUTPUT_ALWAYS, "Warning: Could not open checkpoint file '%s' for writing\n", filename);
+    return ECM_ERROR;
+  }
+  
+  // Write header
+  if (fwrite(header, sizeof(checkpoint_header_t), 1, f) != 1) {
+    outputf(OUTPUT_ERROR, "Error writing checkpoint header\n");
+    fclose(f);
+    return ECM_ERROR;
+  }
+  
+  // Write data
+  if (fwrite(data, 1, data_size, f) != data_size) {
+    outputf(OUTPUT_ERROR, "Error writing checkpoint data\n");
+    fclose(f);
+    return ECM_ERROR;
+  }
+  
+  fclose(f);
+  outputf(OUTPUT_VERBOSE, "Checkpoint saved: s_partial=%lu/%lu (%.1f%%)\n", 
+          header->s_partial, header->s_num_bits, 
+          100.0 * header->s_partial / header->s_num_bits);
+  return ECM_NO_FACTOR_FOUND;
+}
+
+/**
+ * Load checkpoint from file if it exists
+ * Returns 0 if successful, -1 if file doesn't exist or is invalid
+ */
+static
+int load_checkpoint(const char *filename,
+                    checkpoint_header_t *header,
+                    uint32_t **data_ptr,
+                    size_t *data_size_ptr) {
+  FILE *f = fopen(filename, "rb");
+  if (!f) {
+    // File doesn't exist - this is normal on first run
+    return -1;
+  }
+  
+  // Read and validate header
+  checkpoint_header_t temp_header;
+  if (fread(&temp_header, sizeof(checkpoint_header_t), 1, f) != 1) {
+    outputf(OUTPUT_ALWAYS, "Warning: Could not read checkpoint header\n");
+    fclose(f);
+    return -1;
+  }
+  
+  if (temp_header.magic != CHECKPOINT_MAGIC) {
+    outputf(OUTPUT_ALWAYS, "Warning: Checkpoint file has invalid magic number\n");
+    fclose(f);
+    return -1;
+  }
+  
+  if (temp_header.version != CHECKPOINT_VERSION) {
+    outputf(OUTPUT_ALWAYS, "Warning: Checkpoint version mismatch (expected %d, got %d)\n", 
+            CHECKPOINT_VERSION, temp_header.version);
+    fclose(f);
+    return -1;
+  }
+  
+  // Allocate memory for data
+  uint32_t *data = (uint32_t*) malloc(temp_header.data_size);
+  if (!data) {
+    outputf(OUTPUT_ERROR, "Error: Could not allocate memory for checkpoint data\n");
+    fclose(f);
+    return -1;
+  }
+  
+  // Read data
+  if (fread(data, 1, temp_header.data_size, f) != temp_header.data_size) {
+    outputf(OUTPUT_ALWAYS, "Warning: Could not read checkpoint data completely\n");
+    free(data);
+    fclose(f);
+    return -1;
+  }
+  
+  fclose(f);
+  
+  *header = temp_header;
+  *data_ptr = data;
+  *data_size_ptr = temp_header.data_size;
+  
+  time_t now = time(NULL);
+  time_t age = now - temp_header.timestamp;
+  outputf(OUTPUT_NORMAL, "Checkpoint loaded: s_partial=%lu/%lu (%.1f%%), age=%ld seconds\n", 
+          temp_header.s_partial, temp_header.s_num_bits,
+          100.0 * temp_header.s_partial / temp_header.s_num_bits, age);
+  
+  return ECM_NO_FACTOR_FOUND;
+}
+
 int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
              const mpz_t N, const mpz_t s,
-             uint32_t curves, uint32_t sigma,
+             uint32_t curves, uint32_t *sigma_ptr,
+             unsigned long checkpoint_interval_ms,
              float *gputime, int verbose)
 {
+  uint32_t sigma = *sigma_ptr;
   assert( sigma > 0 );
   assert( ((uint64_t) sigma + curves) <= 0xFFFFFFFF ); // no overflow
 
@@ -698,6 +869,13 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
   int32_t   TPI;
   int32_t   IPB;             // IPB = TPB / TPI, instances per block
   size_t    BLOCK_COUNT;     // How many blocks to cover all curves
+  
+  /* Progress variables (may be loaded from checkpoint) */
+  uint64_t s_partial = 0;    // current bit progress
+  int batches_complete = 0;  // number of completed batches
+  
+  /* Result / status variable used throughout the function */
+  int youpi = ECM_NO_FACTOR_FOUND;
 
   /**
    * Smaller TPI is faster, Larger TPI is needed for large inputs.
@@ -725,7 +903,13 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
   available_kernels.push_back((uint32_t)cgbn_params_small::BITS);
   available_kernels.push_back((uint32_t)cgbn_params_medium::BITS);
 
-#ifndef IS_DEV_BUILD
+  // #define IS_DEV_BUILD
+
+  #ifdef IS_DEV_BUILD
+    outputf(OUTPUT_ALWAYS, "Warning: Using dev build with only 2 kernels. Consider adding more kernels for better performance on large inputs.\n");
+  #endif
+
+  #ifndef IS_DEV_BUILD
   /**
    * TPI and BITS have to be set at compile time. Adding multiple cgbn_params
    * (and their associated kernels) allows for better dynamic selection based
@@ -734,20 +918,86 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
    * warning is printed when a particular N might benefit from a custom sized
    * kernel.
    */
+
+  typedef cgbn_params_t<8, 1280>  cgbn_params_1280;
   typedef cgbn_params_t<8, 1536>  cgbn_params_1536;
+  typedef cgbn_params_t<8, 1792>  cgbn_params_1792;
   typedef cgbn_params_t<8, 2048>  cgbn_params_2048;
-  typedef cgbn_params_t<16, 3072> cgbn_params_3072;
-  typedef cgbn_params_t<16, 4096> cgbn_params_4096;
-  typedef cgbn_params_t<16, 6144> cgbn_params_6144;
-  typedef cgbn_params_t<16, 8192> cgbn_params_8192;
-  typedef cgbn_params_t<32, 12288> cgbn_params_12288;
+  available_kernels.push_back((uint32_t)cgbn_params_1280::BITS);
   available_kernels.push_back((uint32_t)cgbn_params_1536::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_1792::BITS);
   available_kernels.push_back((uint32_t)cgbn_params_2048::BITS);
+  
+  typedef cgbn_params_t<16, 2560> cgbn_params_2560;
+  typedef cgbn_params_t<16, 3072> cgbn_params_3072;
+  typedef cgbn_params_t<16, 3584> cgbn_params_3584;
+  typedef cgbn_params_t<16, 4096> cgbn_params_4096;
+  typedef cgbn_params_t<16, 4608> cgbn_params_4608;
+  typedef cgbn_params_t<16, 5120> cgbn_params_5120;
+  typedef cgbn_params_t<16, 5632> cgbn_params_5632;
+  typedef cgbn_params_t<16, 6144> cgbn_params_6144;
+  typedef cgbn_params_t<16, 6656> cgbn_params_6656;
+  typedef cgbn_params_t<16, 7168> cgbn_params_7168;
+  typedef cgbn_params_t<16, 7680> cgbn_params_7680;
+  typedef cgbn_params_t<16, 8192> cgbn_params_8192;
+
+  available_kernels.push_back((uint32_t)cgbn_params_2560::BITS);
   available_kernels.push_back((uint32_t)cgbn_params_3072::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_3584::BITS);
   available_kernels.push_back((uint32_t)cgbn_params_4096::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_4608::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_5120::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_5632::BITS);
   available_kernels.push_back((uint32_t)cgbn_params_6144::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_6656::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_7168::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_7680::BITS);
   available_kernels.push_back((uint32_t)cgbn_params_8192::BITS);
+  
+  typedef cgbn_params_t<32, 9216> cgbn_params_9216;
+  typedef cgbn_params_t<32, 10240> cgbn_params_10240;
+  typedef cgbn_params_t<32, 11264> cgbn_params_11264;
+  typedef cgbn_params_t<32, 12288> cgbn_params_12288;
+  typedef cgbn_params_t<32, 13312> cgbn_params_13312;
+  typedef cgbn_params_t<32, 14336> cgbn_params_14336;
+  typedef cgbn_params_t<32, 15360> cgbn_params_15360;
+  typedef cgbn_params_t<32, 16384> cgbn_params_16384;
+  typedef cgbn_params_t<32, 17408> cgbn_params_17408;
+  typedef cgbn_params_t<32, 18432> cgbn_params_18432;
+  typedef cgbn_params_t<32, 19456> cgbn_params_19456;
+  typedef cgbn_params_t<32, 20480> cgbn_params_20480;
+  typedef cgbn_params_t<32, 21504> cgbn_params_21504;
+  typedef cgbn_params_t<32, 22528> cgbn_params_22528;
+  typedef cgbn_params_t<32, 23552> cgbn_params_23552;
+  typedef cgbn_params_t<32, 24576> cgbn_params_24576;
+  typedef cgbn_params_t<32, 25600> cgbn_params_25600;
+  typedef cgbn_params_t<32, 26624> cgbn_params_26624;
+  typedef cgbn_params_t<32, 27648> cgbn_params_27648;
+  typedef cgbn_params_t<32, 28672> cgbn_params_28672;
+  typedef cgbn_params_t<32, 32768> cgbn_params_32768;
+  
+  available_kernels.push_back((uint32_t)cgbn_params_9216::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_10240::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_11264::BITS);
   available_kernels.push_back((uint32_t)cgbn_params_12288::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_13312::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_14336::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_15360::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_16384::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_17408::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_18432::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_19456::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_20480::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_21504::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_22528::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_23552::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_24576::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_25600::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_26624::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_27648::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_28672::BITS);
+  available_kernels.push_back((uint32_t)cgbn_params_32768::BITS);
+
 #endif
 
   /* Pointer to CUDA kernel. */
@@ -755,6 +1005,50 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
         uint32_t*, uint32_t*, uint32_t, uint32_t, uint32_t) = NULL;
 
   size_t n_log2 = mpz_sizeinbase(N, 2);
+  
+  // ========== CHECKPOINT LOADING ==========
+  char *ckpt_filename = get_checkpoint_filename(N);
+  checkpoint_header_t ckpt_header;
+  uint32_t *ckpt_data = NULL;
+  size_t ckpt_data_size = 0;
+  int ckpt_loaded = 0;
+  
+  // Try to load checkpoint
+  if (load_checkpoint(ckpt_filename, &ckpt_header, &ckpt_data, &ckpt_data_size) == ECM_NO_FACTOR_FOUND) {
+    // Validate checkpoint compatibility
+    // Only check curves and s_num_bits (sigma is a range in real usage)
+    outputf(OUTPUT_TRACE, "Checkpoint validation: curves=%u(expect %u), s_num_bits=%lu(expect %lu)\n",
+            ckpt_header.curves, curves, ckpt_header.s_num_bits, s_num_bits);
+    
+    if (ckpt_header.curves == curves && 
+        ckpt_header.s_num_bits == s_num_bits) {
+      
+      outputf(OUTPUT_NORMAL, "Resuming from checkpoint: %.1f%% complete (s_partial=%lu/%lu)\n",
+              100.0 * ckpt_header.s_partial / ckpt_header.s_num_bits,
+              ckpt_header.s_partial, ckpt_header.s_num_bits);
+
+      if (sigma != ckpt_header.sigma) {
+        outputf(OUTPUT_VERBOSE, "Checkpoint sigma overrides current sigma: %u -> %u\n",
+                sigma, ckpt_header.sigma);
+      }
+      
+      ckpt_loaded = 1;
+      sigma = ckpt_header.sigma;
+      BITS = ckpt_header.BITS;
+      TPI = ckpt_header.TPI;  // Restore TPI from checkpoint
+      data_size = ckpt_header.data_size;
+      data = ckpt_data;
+      s_partial = ckpt_header.s_partial;
+      batches_complete = ckpt_header.batches_complete;
+    } else {
+      outputf(OUTPUT_NORMAL, "Checkpoint parameters mismatch (curves or s_num_bits differ), starting fresh\n");
+      if (ckpt_data) free(ckpt_data);
+      ckpt_loaded = 0;
+    }
+  }
+  
+  // If no checkpoint, proceed with normal initialization
+  if (!ckpt_loaded) {
   for (int k_i = 0; k_i < available_kernels.size(); k_i++) {
     uint32_t kernel_bits = available_kernels[k_i];
     if (kernel_bits >= n_log2 + CARRY_BITS) {
@@ -770,27 +1064,117 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
         TPI = cgbn_params_medium::TPI;
         kernel = kernel_double_add<cgbn_params_medium>;
 #ifndef IS_DEV_BUILD
+      } else if (BITS == cgbn_params_1280::BITS) {
+        TPI = cgbn_params_1280::TPI;
+        kernel = kernel_double_add<cgbn_params_1280>;
       } else if (BITS == cgbn_params_1536::BITS) {
         TPI = cgbn_params_1536::TPI;
         kernel = kernel_double_add<cgbn_params_1536>;
+      } else if (BITS == cgbn_params_1792::BITS) {
+        TPI = cgbn_params_1792::TPI;
+        kernel = kernel_double_add<cgbn_params_1792>;
       } else if (BITS == cgbn_params_2048::BITS) {
         TPI = cgbn_params_2048::TPI;
         kernel = kernel_double_add<cgbn_params_2048>;
+      } else if (BITS == cgbn_params_2560::BITS) {
+        TPI = cgbn_params_2560::TPI;
+        kernel = kernel_double_add<cgbn_params_2560>;
       } else if (BITS == cgbn_params_3072::BITS) {
         TPI = cgbn_params_3072::TPI;
         kernel = kernel_double_add<cgbn_params_3072>;
+      } else if (BITS == cgbn_params_3584::BITS) {
+        TPI = cgbn_params_3584::TPI;
+        kernel = kernel_double_add<cgbn_params_3584>;
       } else if (BITS == cgbn_params_4096::BITS) {
         TPI = cgbn_params_4096::TPI;
         kernel = kernel_double_add<cgbn_params_4096>;
+      } else if (BITS == cgbn_params_4608::BITS) {
+        TPI = cgbn_params_4608::TPI;
+        kernel = kernel_double_add<cgbn_params_4608>;
+      } else if (BITS == cgbn_params_5120::BITS) {
+        TPI = cgbn_params_5120::TPI;
+        kernel = kernel_double_add<cgbn_params_5120>;
+      } else if (BITS == cgbn_params_5632::BITS) {
+        TPI = cgbn_params_5632::TPI;
+        kernel = kernel_double_add<cgbn_params_5632>;
       } else if (BITS == cgbn_params_6144::BITS) {
         TPI = cgbn_params_6144::TPI;
         kernel = kernel_double_add<cgbn_params_6144>;
+      } else if (BITS == cgbn_params_6656::BITS) {
+        TPI = cgbn_params_6656::TPI;
+        kernel = kernel_double_add<cgbn_params_6656>;
+      } else if (BITS == cgbn_params_7168::BITS) {
+        TPI = cgbn_params_7168::TPI;
+        kernel = kernel_double_add<cgbn_params_7168>;
+      } else if (BITS == cgbn_params_7680::BITS) {
+        TPI = cgbn_params_7680::TPI;
+        kernel = kernel_double_add<cgbn_params_7680>;
       } else if (BITS == cgbn_params_8192::BITS) {
         TPI = cgbn_params_8192::TPI;
         kernel = kernel_double_add<cgbn_params_8192>;
+      } else if (BITS == cgbn_params_9216::BITS) {
+        TPI = cgbn_params_9216::TPI;
+        kernel = kernel_double_add<cgbn_params_9216>;
+      } else if (BITS == cgbn_params_10240::BITS) {
+        TPI = cgbn_params_10240::TPI;
+        kernel = kernel_double_add<cgbn_params_10240>;
+      } else if (BITS == cgbn_params_11264::BITS) {
+        TPI = cgbn_params_11264::TPI;
+        kernel = kernel_double_add<cgbn_params_11264>;
       } else if (BITS == cgbn_params_12288::BITS) {
         TPI = cgbn_params_12288::TPI;
         kernel = kernel_double_add<cgbn_params_12288>;
+      } else if (BITS == cgbn_params_13312::BITS) {
+        TPI = cgbn_params_13312::TPI;
+        kernel = kernel_double_add<cgbn_params_13312>;
+      } else if (BITS == cgbn_params_14336::BITS) {
+        TPI = cgbn_params_14336::TPI;
+        kernel = kernel_double_add<cgbn_params_14336>;
+      } else if (BITS == cgbn_params_15360::BITS) {
+        TPI = cgbn_params_15360::TPI;
+        kernel = kernel_double_add<cgbn_params_15360>;
+      } else if (BITS == cgbn_params_16384::BITS) {
+        TPI = cgbn_params_16384::TPI;
+        kernel = kernel_double_add<cgbn_params_16384>;
+      } else if (BITS == cgbn_params_17408::BITS) {
+        TPI = cgbn_params_17408::TPI;
+        kernel = kernel_double_add<cgbn_params_17408>;
+      } else if (BITS == cgbn_params_18432::BITS) {
+        TPI = cgbn_params_18432::TPI;
+        kernel = kernel_double_add<cgbn_params_18432>;
+      } else if (BITS == cgbn_params_19456::BITS) {
+        TPI = cgbn_params_19456::TPI;
+        kernel = kernel_double_add<cgbn_params_19456>;
+      } else if (BITS == cgbn_params_20480::BITS) {
+        TPI = cgbn_params_20480::TPI;
+        kernel = kernel_double_add<cgbn_params_20480>;
+      } else if (BITS == cgbn_params_21504::BITS) {
+        TPI = cgbn_params_21504::TPI;
+        kernel = kernel_double_add<cgbn_params_21504>;
+      } else if (BITS == cgbn_params_22528::BITS) {
+        TPI = cgbn_params_22528::TPI;
+        kernel = kernel_double_add<cgbn_params_22528>;
+      } else if (BITS == cgbn_params_23552::BITS) {
+        TPI = cgbn_params_23552::TPI;
+        kernel = kernel_double_add<cgbn_params_23552>;
+      } else if (BITS == cgbn_params_24576::BITS) {
+        TPI = cgbn_params_24576::TPI;
+        kernel = kernel_double_add<cgbn_params_24576>;
+      } else if (BITS == cgbn_params_25600::BITS) {
+        TPI = cgbn_params_25600::TPI;
+        kernel = kernel_double_add<cgbn_params_25600>;
+      } else if (BITS == cgbn_params_26624::BITS) {
+        TPI = cgbn_params_26624::TPI;
+        kernel = kernel_double_add<cgbn_params_26624>;
+      } else if (BITS == cgbn_params_27648::BITS) {
+        TPI = cgbn_params_27648::TPI;
+        kernel = kernel_double_add<cgbn_params_27648>;
+      } else if (BITS == cgbn_params_28672::BITS) {
+        TPI = cgbn_params_28672::TPI;
+        kernel = kernel_double_add<cgbn_params_28672>;
+      } else if (BITS == cgbn_params_32768::BITS) {
+        TPI = cgbn_params_32768::TPI;
+        kernel = kernel_double_add<cgbn_params_32768>;
 #endif
       } else {
         outputf (OUTPUT_ERROR, "CGBN kernel not found for %d bits\n", BITS);
@@ -823,7 +1207,7 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
     }
   }
 
-  int youpi = verify_size_of_n(N, BITS);
+  youpi = verify_size_of_n(N, BITS);
   if (youpi != ECM_NO_FACTOR_FOUND) {
     return youpi;
   }
@@ -831,7 +1215,104 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
   /* Consistency check that struct cgbn_mem_t is byte aligned without extra fields. */
   assert( sizeof(curve_t<cgbn_params_small>::mem_t) == cgbn_params_small::BITS/8 );
   assert( sizeof(curve_t<cgbn_params_medium>::mem_t) == cgbn_params_medium::BITS/8 );
-  data = set_p_2p(N, curves, sigma, BITS, &data_size);
+  
+  if (!ckpt_loaded) {
+    data = set_p_2p(N, curves, sigma, BITS, &data_size);
+    s_partial = 1;      // First bit (doubling) is handled in set_p_2p
+    batches_complete = 0;
+  }
+  } // Close the "if (!ckpt_loaded)" block from checkpoint loading
+  else {
+    // If checkpoint loaded, still need to set kernel based on BITS and TPI
+    if (BITS == cgbn_params_small::BITS) {
+      kernel = kernel_double_add<cgbn_params_small>;
+    } else if (BITS == cgbn_params_medium::BITS) {
+      kernel = kernel_double_add<cgbn_params_medium>;
+#ifndef IS_DEV_BUILD
+    } else if (BITS == cgbn_params_1280::BITS) {
+      kernel = kernel_double_add<cgbn_params_1280>;
+    } else if (BITS == cgbn_params_1536::BITS) {
+      kernel = kernel_double_add<cgbn_params_1536>;
+    } else if (BITS == cgbn_params_1792::BITS) {
+      kernel = kernel_double_add<cgbn_params_1792>;
+    } else if (BITS == cgbn_params_2048::BITS) {
+      kernel = kernel_double_add<cgbn_params_2048>;
+    } else if (BITS == cgbn_params_2560::BITS) {
+      kernel = kernel_double_add<cgbn_params_2560>;
+    } else if (BITS == cgbn_params_3072::BITS) {
+      kernel = kernel_double_add<cgbn_params_3072>;
+    } else if (BITS == cgbn_params_3584::BITS) {
+      kernel = kernel_double_add<cgbn_params_3584>;
+    } else if (BITS == cgbn_params_4096::BITS) {
+      kernel = kernel_double_add<cgbn_params_4096>;
+    } else if (BITS == cgbn_params_4608::BITS) {
+      kernel = kernel_double_add<cgbn_params_4608>;
+    } else if (BITS == cgbn_params_5120::BITS) {
+      kernel = kernel_double_add<cgbn_params_5120>;
+    } else if (BITS == cgbn_params_5632::BITS) {
+      kernel = kernel_double_add<cgbn_params_5632>;
+    } else if (BITS == cgbn_params_6144::BITS) {
+      kernel = kernel_double_add<cgbn_params_6144>;
+    } else if (BITS == cgbn_params_6656::BITS) {
+      kernel = kernel_double_add<cgbn_params_6656>;
+    } else if (BITS == cgbn_params_7168::BITS) {
+      kernel = kernel_double_add<cgbn_params_7168>;
+    } else if (BITS == cgbn_params_7680::BITS) {
+      kernel = kernel_double_add<cgbn_params_7680>;
+    } else if (BITS == cgbn_params_8192::BITS) {
+      kernel = kernel_double_add<cgbn_params_8192>;
+    } else if (BITS == cgbn_params_9216::BITS) {
+      kernel = kernel_double_add<cgbn_params_9216>;
+    } else if (BITS == cgbn_params_10240::BITS) {
+      kernel = kernel_double_add<cgbn_params_10240>;
+    } else if (BITS == cgbn_params_11264::BITS) {
+      kernel = kernel_double_add<cgbn_params_11264>;
+    } else if (BITS == cgbn_params_12288::BITS) {
+      kernel = kernel_double_add<cgbn_params_12288>;
+    } else if (BITS == cgbn_params_13312::BITS) {
+      kernel = kernel_double_add<cgbn_params_13312>;
+    } else if (BITS == cgbn_params_14336::BITS) {
+      kernel = kernel_double_add<cgbn_params_14336>;
+    } else if (BITS == cgbn_params_15360::BITS) {
+      kernel = kernel_double_add<cgbn_params_15360>;
+    } else if (BITS == cgbn_params_16384::BITS) {
+      kernel = kernel_double_add<cgbn_params_16384>;
+    } else if (BITS == cgbn_params_17408::BITS) {
+      kernel = kernel_double_add<cgbn_params_17408>;
+    } else if (BITS == cgbn_params_18432::BITS) {
+      kernel = kernel_double_add<cgbn_params_18432>;
+    } else if (BITS == cgbn_params_19456::BITS) {
+      kernel = kernel_double_add<cgbn_params_19456>;
+    } else if (BITS == cgbn_params_20480::BITS) {
+      kernel = kernel_double_add<cgbn_params_20480>;
+    } else if (BITS == cgbn_params_21504::BITS) {
+      kernel = kernel_double_add<cgbn_params_21504>;
+    } else if (BITS == cgbn_params_22528::BITS) {
+      kernel = kernel_double_add<cgbn_params_22528>;
+    } else if (BITS == cgbn_params_23552::BITS) {
+      kernel = kernel_double_add<cgbn_params_23552>;
+    } else if (BITS == cgbn_params_24576::BITS) {
+      kernel = kernel_double_add<cgbn_params_24576>;
+    } else if (BITS == cgbn_params_25600::BITS) {
+      kernel = kernel_double_add<cgbn_params_25600>;
+    } else if (BITS == cgbn_params_26624::BITS) {
+      kernel = kernel_double_add<cgbn_params_26624>;
+    } else if (BITS == cgbn_params_27648::BITS) {
+      kernel = kernel_double_add<cgbn_params_27648>;
+    } else if (BITS == cgbn_params_28672::BITS) {
+      kernel = kernel_double_add<cgbn_params_28672>;
+    } else if (BITS == cgbn_params_32768::BITS) {
+      kernel = kernel_double_add<cgbn_params_32768>;
+#endif
+    } else {
+      outputf(OUTPUT_ERROR, "CGBN kernel not found for BITS=%d TPI=%d from checkpoint\n", BITS, TPI);
+      return ECM_ERROR;
+    }
+    
+    IPB = TPB / TPI;
+    BLOCK_COUNT = (curves + IPB - 1) / IPB;
+    outputf(OUTPUT_VERBOSE, "Checkpoint: restored BITS=%d, TPI=%d, BLOCK_COUNT=%lu\n", BITS, TPI, BLOCK_COUNT);
+  }
 
   /* np0 is -(N^-1 mod 2**32), used for montgomery representation */
   uint32_t np0 = find_np0(N);
@@ -845,15 +1326,25 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
           "CGBN<%d, %d> running kernel<%d block x %d threads> input number is %d bits\n",
           BITS, TPI, BLOCK_COUNT, TPB, n_log2);
 
-  /* First bit (doubling) is handled in set_p_2p */
-  uint64_t s_partial = 1;
-
   /* Start with small batches and increase till timing is ~100ms */
   uint64_t batch_size = 200;
-
-  int batches_complete = 0;
+  
   /* gputime and batch_time are measured in ms */
   float batch_time = 0;
+  
+  /* Track time for checkpoint saving */
+  float last_checkpoint_time = 0;
+
+  // if (checkpoint_interval_ms > 86400000) { // > 1 day, treat as disabled
+  //   checkpoint_interval_ms = 86400000; // 1 day max
+  // }
+
+  if (checkpoint_interval_ms > 0) {
+    outputf(OUTPUT_NORMAL, "Checkpoint autosave interval: %lu ms (%.2f min)\n",
+            checkpoint_interval_ms, checkpoint_interval_ms / 1000.0 / 60.0);
+  } else {
+    outputf(OUTPUT_NORMAL, "Checkpoint autosave disabled\n");
+  }
 
   while (s_partial < s_num_bits) {
     /* decrease batch_size for final batch if needed */
@@ -899,6 +1390,29 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
     } else if (batch_time > 120) {
       batch_size = max(100ul, 9*batch_size / 10);
     }
+    
+    // ========== CHECKPOINT SAVING ==========
+    if (checkpoint_interval_ms > 0 &&
+      (*gputime - last_checkpoint_time) >= checkpoint_interval_ms) {
+      // Copy data back from GPU temporarily for checkpoint
+      CUDA_CHECK(cudaMemcpy(data, gpu_data, data_size, cudaMemcpyDeviceToHost));
+      
+      checkpoint_header_t header;
+      header.magic = CHECKPOINT_MAGIC;
+      header.version = CHECKPOINT_VERSION;
+      header.s_partial = s_partial;
+      header.s_num_bits = s_num_bits;
+      header.batches_complete = batches_complete;
+      header.curves = curves;
+      header.sigma = sigma;
+      header.BITS = BITS;
+      header.TPI = TPI;  // Save TPI for kernel selection on reload
+      header.data_size = data_size;
+      header.timestamp = time(NULL);
+      
+      save_checkpoint(ckpt_filename, &header, data, data_size);
+      last_checkpoint_time = *gputime;
+    }
   }
 
   // Copy data back from GPU memory
@@ -919,6 +1433,15 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
 
   free(s_bits);
   free(data);
+  
+  // ========== CHECKPOINT CLEANUP ==========
+  // Remove checkpoint file on successful completion
+  if (youpi != ECM_ERROR && remove(ckpt_filename) == 0) {
+    outputf (OUTPUT_VERBOSE, "Checkpoint file removed\n");
+  }
+
+  /* Write back possibly-updated sigma to caller */
+  *sigma_ptr = sigma;
 
   return youpi;
 }

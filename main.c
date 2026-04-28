@@ -25,6 +25,8 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #include <sys/stat.h>
 #include <time.h>
 #include <math.h>
+#include <errno.h>
+#include <limits.h>
 #ifdef _MSC_VER
 #  include <winsock2.h>
 #endif
@@ -141,11 +143,14 @@ usage (void)
     printf ("  -bloadms file With -param 1-3, mmap stage 1 exponent from file.\n");
 #endif
 #ifdef WITH_GPU
+    printf ("  ----------------------------------------------------------------\n");
     printf ("  -gpu         Use CGBN for computations stage 1.\n");
     printf ("  -gpudevice n Use device n to execute GPU code (by default, "
                                                           "CUDA chooses)\n");
     printf ("  -gpucurves n Compute on n curves in parallel on the GPU (by "
                                                   "default, CUDA chooses)\n");
+    printf ("  -gpuckpt s   save GPU checkpoint every s seconds (0 disables)\n");
+    printf ("  ----------------------------------------------------------------\n");
 #endif /* WITH_GPU */
 #ifdef HAVE_GWNUM
     printf ("  -force-gwnum       Use gwnum routines for ECM stage 1 (if possible).\n");
@@ -471,6 +476,7 @@ main (int argc, char *argv[])
                       /* chooses)                                             */
   unsigned int gpucurves = 0; /* How many curves do we want for GPU code */ 
                               /* (by default CUDA chooses)               */
+  double gpuckpt_seconds = -1.0;
 
   /* check ecm is linked with a compatible library */
   if (mp_bits_per_limb != GMP_NUMB_BITS)
@@ -907,6 +913,19 @@ main (int argc, char *argv[])
           argv += 2;
           argc -= 2;
         }
+      else if ((argc > 2) && (strcmp (argv[1], "-gpuckpt") == 0))
+        {
+          char *endptr = NULL;
+          errno = 0;
+          double tmp = strtod(argv[2], &endptr);
+          if (endptr == argv[2] || errno == ERANGE || tmp < 0.0) {
+            fprintf (stderr, "Error, invalid -gpuckpt value: %s\n", argv[2]);
+            exit (EXIT_FAILURE);
+          }
+          gpuckpt_seconds = tmp;
+          argv += 2;
+          argc -= 2;
+        }
 #endif
       else
 	{
@@ -1061,6 +1080,22 @@ main (int argc, char *argv[])
                                   /* use_gpu = 0, it has no meaning   */
   params->gpu_number_of_curves = gpucurves; /* If WITH_GPU is not defined or */
                                             /* use_gpu = 0, it has no meaning*/
+  if (gpuckpt_seconds < 0.0) {
+    params->gpu_checkpoint_interval_ms = ECM_DEFAULT_GPU_CHECKPOINT_INTERVAL_MS;
+  } else {
+    double val_ms = gpuckpt_seconds * 1000.0;
+    if (val_ms != val_ms) { /* NaN */
+      fprintf(stderr, "Error, invalid -gpuckpt value (NaN)\n");
+      exit(EXIT_FAILURE);
+    }
+    if (val_ms <= 0.0) {
+      params->gpu_checkpoint_interval_ms = 0;
+    } else if (val_ms >= (double) ULONG_MAX) {
+      params->gpu_checkpoint_interval_ms = ULONG_MAX;
+    } else {
+      params->gpu_checkpoint_interval_ms = (unsigned long) llround(val_ms);
+    }
+  }
 
   /* Open resume file for reading, if resuming is requested */
   if (resumefilename != NULL)

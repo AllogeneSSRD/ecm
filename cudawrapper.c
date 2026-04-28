@@ -386,7 +386,11 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   st = cputime ();
 
   youpi = cgbn_ecm_stage1 (factors, array_found, n, params->batch_s, nb_curves,
-                           firstsigma_ui, &gputime, params->verbose);
+                           &firstsigma_ui, params->gpu_checkpoint_interval_ms,
+                           &gputime, params->verbose);
+
+  /* Ensure params->sigma reflects any checkpoint-overridden sigma */
+  mpz_set_ui (mutable_params->sigma, firstsigma_ui);
 
   outputf (OUTPUT_NORMAL, "Computing %u Step 1 took %ldms of CPU time / "
                           "%.0fms of GPU time\n", nb_curves,

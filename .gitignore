@@ -74,3 +74,6 @@ missing
 powerpc64/Makefile
 stamp-h1
 stamp-h2
+
+CHECKPOINT_*
+*.bak
